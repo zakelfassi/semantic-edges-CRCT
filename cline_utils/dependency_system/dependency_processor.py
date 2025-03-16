@@ -340,7 +340,7 @@ def generate_embeddings(root_paths: List[str], output_dir: str, model_name: str 
         print(f"Error: Could not load Sentence Transformer model '{model_name}'. Ensure it's installed: {e}")
         sys.exit(1)
 
-    key_map = generate_keys(root_paths)[0]
+    key_map, _ = generate_keys(root_paths)
 
     for key, path in key_map.items():
         if not os.path.isfile(path):
@@ -379,8 +379,83 @@ def generate_embeddings(root_paths: List[str], output_dir: str, model_name: str 
         json.dump(metadata, f, indent=4)
 
 
-def suggest_dependencies(tracker_file: str, tracker_type: str, key_map: Dict[str, str]) -> Dict[str, List[Tuple[str, str]]]:
-    """Suggest dependencies based on tracker type and file content."""
+def suggest_semantic_edges(
+    key_map: Dict[str, str],
+    embeddings_dir: str,
+    threshold: float = 0.65
+) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    Suggest edges between keys based on semantic similarity above a given threshold.
+    We'll treat the relationship as 'x' (mutual) if they exceed threshold.
+
+    Return: Dict[row_key, List[(col_key, dep_char)]]
+    """
+    suggestions = defaultdict(list)
+    all_keys = list(key_map.keys())
+
+    # For each pair, measure similarity
+    for i in range(len(all_keys)):
+        for j in range(i + 1, len(all_keys)):
+            k1, k2 = all_keys[i], all_keys[j]
+            sim = calculate_similarity(k1, k2, embeddings_dir)
+            # If above threshold, treat as mutual dependency
+            if sim > threshold:
+                suggestions[k1].append((k2, 'x'))
+                suggestions[k2].append((k1, 'x'))
+    return suggestions
+
+
+def suggest_dependencies(tracker_file: str, tracker_type: str, key_map: Dict[str, str],
+                         distance_mode: str = "standard") -> Dict[str, List[Tuple[str, str]]]:
+    """Suggest dependencies based on tracker type and file content (with optional semantic distance)."""
+    suggestions: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    embeddings_dir = os.path.join(os.path.dirname(tracker_file), "embeddings")
+    metadata_path = os.path.join(embeddings_dir, "metadata.json")
+
+    # If user selects semantic distance, we handle that first, for 'main' or 'doc' usage
+    if distance_mode == "semantic":
+        if not os.path.exists(embeddings_dir):
+            print(f"Error: Embeddings folder '{embeddings_dir}' not found. Run 'generate-embeddings' first.")
+            sys.exit(1)
+        # We'll generate semantic-based edges
+        semantic_suggestions = suggest_semantic_edges(key_map, embeddings_dir, threshold=0.65)
+        # Merge them in after we do the standard approach, or skip standard if purely semantic
+        # For a fully semantic approach, let's skip standard references. We'll do "doc" or "mini" if needed.
+        # But let's demonstrate how it might overlay:
+        if tracker_type in ("main", "doc", "mini"):
+            # We'll proceed with standard or doc or mini approach too, then merge
+            base_suggestions = _standard_suggest(tracker_file, tracker_type, key_map)
+            suggestions = _merge_suggestions(base_suggestions, semantic_suggestions)
+        else:
+            suggestions = semantic_suggestions
+        return suggestions
+
+    # If not semantic, do the standard approach
+    return _standard_suggest(tracker_file, tracker_type, key_map)
+
+
+def _merge_suggestions(sugg_a: Dict[str, List[Tuple[str, str]]],
+                       sugg_b: Dict[str, List[Tuple[str, str]]]) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    Merge two suggestions dicts. If a row->(col,char) pair is in both, keep the first or unify.
+    """
+    merged = defaultdict(list)
+    # Copy from sugg_a
+    for row_key, deps in sugg_a.items():
+        merged[row_key].extend(deps)
+    # Add from sugg_b, skipping duplicates
+    for row_key, deps in sugg_b.items():
+        for col_key, dep_char in deps:
+            if (col_key, dep_char) not in merged[row_key]:
+                merged[row_key].append((col_key, dep_char))
+    return merged
+
+
+def _standard_suggest(tracker_file: str, tracker_type: str,
+                      key_map: Dict[str, str]) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    Original logic for code/doc/mini suggestions
+    """
     suggestions: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
     embeddings_dir = os.path.join(os.path.dirname(tracker_file), "embeddings")
     metadata_path = os.path.join(embeddings_dir, "metadata.json")
@@ -406,18 +481,21 @@ def suggest_dependencies(tracker_file: str, tracker_type: str, key_map: Dict[str
             sys.exit(1)
 
         for key, data in metadata.items():
+            # explicit references
             for ref_path in find_explicit_references(data['path'], os.path.dirname(tracker_file)):
                 for other_key, other_path in key_map.items():
                     if os.path.normpath(other_path).replace("\\", "/") == ref_path:
                         suggestions[key].append((other_key, 'd'))
                         break
 
+            # also do a standard doc embeddings similarity > 0.65 => x
             for other_key in metadata:
                 if key != other_key:
                     similarity = calculate_similarity(key, other_key, embeddings_dir)
                     print(f"Similarity between {key} and {other_key}: {similarity}")
                     if similarity > 0.65:
                         suggestions[key].append((other_key, 'x'))
+
     elif tracker_type == "mini":
         for key, path in key_map.items():
             if path.endswith(".py") and os.path.isfile(path):  # Only Python files
@@ -427,6 +505,7 @@ def suggest_dependencies(tracker_file: str, tracker_type: str, key_map: Dict[str
                         if other_path.startswith(imported_module) and key != other_key:
                             suggestions[key].append((other_key, '<'))
                             suggestions[other_key].append((key, '>'))
+                    # doc references as well
                     for other_key, other_path in key_map.items():
                         if other_path.startswith(os.path.normpath(os.path.join(os.path.dirname(tracker_file), "../docs")).replace("\\", "/")):
                             if imported_module in other_path:
@@ -435,7 +514,8 @@ def suggest_dependencies(tracker_file: str, tracker_type: str, key_map: Dict[str
     return suggestions
 
 
-def update_tracker(output_file: str, key_map: Dict[str, str], tracker_type: str = "mini", suggestions: Optional[Dict[str, List[Tuple[str, str]]]] = None, sort_keys: bool = True):
+def update_tracker(output_file: str, key_map: Dict[str, str], tracker_type: str = "mini",
+                   suggestions: Optional[Dict[str, List[Tuple[str, str]]]] = None, sort_keys: bool = True):
     """Updates or creates a tracker file."""
     def sort_key(key):
         parts = re.findall(r'\d+|\D+', key)
@@ -486,7 +566,10 @@ def update_tracker(output_file: str, key_map: Dict[str, str], tracker_type: str 
                 if row_key not in sorted_merged_keys:
                     print(f"Warning: Row key '{row_key}' not in tracker; skipping.")
                     continue
-                current_row_str = updated_grid.get(row_key, compress(''.join(["o" if row_key == col_key else "p" for col_key in sorted_merged_keys])))
+                current_row_str = updated_grid.get(
+                    row_key,
+                    compress(''.join(["o" if row_key == col_key else "p" for col_key in sorted_merged_keys]))
+                )
                 decompressed = decompress(current_row_str)
                 for col_key, dep_char in deps:
                     if col_key not in sorted_merged_keys:
@@ -622,6 +705,9 @@ if __name__ == "__main__":
     parser_suggest.add_argument("--tracker", type=str, required=True, help="Tracker file to analyze")
     parser_suggest.add_argument("--tracker_type", type=str, required=True, choices=["main", "doc", "mini"],
                                 help="Type of the tracker file")
+    # New argument for distance mode
+    parser_suggest.add_argument("--distance", type=str, default="standard", choices=["standard", "semantic"],
+                                help="Select distance-based approach for suggestions (standard or semantic)")
 
     # generate-embeddings
     parser_embed = subparsers.add_parser("generate-embeddings", help="Generate embeddings for files")
@@ -734,6 +820,8 @@ if __name__ == "__main__":
             sys.exit(1)
 
     elif args.command == "suggest-dependencies":
+        # Parse the --distance arg
+        distance_mode = getattr(args, "distance", "standard")
         key_map = {}
         if os.path.exists(args.tracker):
             with open(args.tracker, "r", encoding="utf-8") as f:
@@ -743,7 +831,8 @@ if __name__ == "__main__":
         else:
             print(f"Error: Tracker file '{args.tracker}' not found")
             sys.exit(1)
-        suggestions = suggest_dependencies(args.tracker, args.tracker_type, key_map)
+        # Use the new optional distance_mode
+        suggestions = suggest_dependencies(args.tracker, args.tracker_type, key_map, distance_mode=distance_mode)
         print(json.dumps(suggestions, indent=4))
         update_tracker(args.tracker, key_map, args.tracker_type, suggestions, sort_keys=False)
 
